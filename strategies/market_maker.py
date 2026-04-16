@@ -26,6 +26,7 @@ import structlog
 from core.client import PolymarketClient, OrderBook, Market
 from core.wallet import Wallet
 from risk.manager import RiskManager, RiskCheck
+from utils.metrics import MetricsTracker, Trade
 
 logger = structlog.get_logger()
 
@@ -47,16 +48,20 @@ class MarketMaker:
         wallet: Wallet,
         risk: RiskManager,
         dry_run: bool = True,
+        metrics: Optional[MetricsTracker] = None,
     ):
         self.client = client
         self.wallet = wallet
         self.risk = risk
         self.dry_run = dry_run
+        self.metrics = metrics
 
         # Strategy params
         self.target_spread_cents: float = 4.0  # minimum spread to quote
         self.order_size: float = 25.0
-        self.refresh_interval: float = 5.0  # seconds between requotes
+        self.refresh_interval: float = 5.0  # seconds between full requotes
+        self.monitor_interval: float = 1.0   # seconds between intra-sleep price checks
+        self.cancel_on_deviation_cents: float = 3.0  # emergency-cancel if mid moves this much
         self.min_volume: float = 10000
         self.min_liquidity: float = 5000
 
@@ -116,10 +121,47 @@ class MarketMaker:
                 if hedge:
                     logger.info("mm.hedge_suggested", **hedge)
 
+                # 6. Monitor price between requotes — cancel immediately if price moves
+                #    more than cancel_on_deviation_cents. This shrinks the adverse-selection
+                #    window from refresh_interval (5s) down to monitor_interval (1s).
+                quoted_mid = book_yes.mid_price
+                await self._monitor_until_refresh(market, quoted_mid)
+
             except Exception as e:
                 logger.error("mm.market.error", error=str(e), market=market.question[:40])
 
-            await asyncio.sleep(self.refresh_interval)
+    async def _monitor_until_refresh(self, market: Market, quoted_mid: Optional[float]):
+        """
+        Poll the YES order book every monitor_interval seconds.
+        If mid-price deviates beyond cancel_on_deviation_cents, cancel all
+        open quotes immediately rather than waiting for the full refresh cycle.
+        """
+        elapsed = 0.0
+        threshold = self.cancel_on_deviation_cents / 100
+
+        while elapsed < self.refresh_interval and self._running:
+            await asyncio.sleep(self.monitor_interval)
+            elapsed += self.monitor_interval
+
+            if quoted_mid is None:
+                break
+
+            try:
+                fresh = await self.client.get_order_book(market.token_id_yes)
+                if fresh.mid_price is None:
+                    break
+                deviation = abs(fresh.mid_price - quoted_mid)
+                if deviation >= threshold:
+                    await self._cancel_market_orders(market.condition_id)
+                    logger.info(
+                        "mm.emergency_cancel",
+                        market=market.question[:40],
+                        deviation_cents=round(deviation * 100, 1),
+                        threshold_cents=self.cancel_on_deviation_cents,
+                    )
+                    break  # let the outer loop immediately requote at the new price
+            except Exception:
+                break  # don't crash the main loop on a monitor poll failure
 
     def _calculate_quotes(
         self, book: OrderBook, token_id: str, side: str
@@ -171,7 +213,7 @@ class MarketMaker:
     async def _place_quote(
         self, market: Market, quote: QuotePair, token_id: str, side: str
     ):
-        """Place bid and ask orders."""
+        """Place bid and ask orders and record fills."""
         bid_id = await self.client.place_limit_order(
             token_id=token_id,
             side="BUY",
@@ -189,6 +231,53 @@ class MarketMaker:
 
         order_ids = [oid for oid in [bid_id, ask_id] if oid]
         self._active_orders[market.condition_id] = order_ids
+
+        # Record fills (simulated in dry_run; approximate for live GTC orders)
+        self.wallet.record_fill(
+            token_id=token_id,
+            side=side,
+            buy_sell="BUY",
+            size=quote.size,
+            price=quote.bid_price,
+        )
+        sell_pnl = self.wallet.record_fill(
+            token_id=token_id,
+            side=side,
+            buy_sell="SELL",
+            size=quote.size,
+            price=quote.ask_price,
+        )
+        # Propagate realized PnL to risk manager's daily tracker
+        if sell_pnl:
+            self.risk.record_pnl(sell_pnl)
+
+        if self.metrics:
+            now = time.time()
+            self.metrics.record_trade(
+                Trade(
+                    timestamp=now,
+                    strategy="market_maker",
+                    market=market.condition_id,
+                    side=side,
+                    direction="BUY",
+                    size=quote.size,
+                    price=quote.bid_price,
+                )
+            )
+            spread_pnl = round(quote.size * (quote.ask_price - quote.bid_price), 4)
+            self.metrics.record_trade(
+                Trade(
+                    timestamp=now,
+                    strategy="market_maker",
+                    market=market.condition_id,
+                    side=side,
+                    direction="SELL",
+                    size=quote.size,
+                    price=quote.ask_price,
+                    pnl=spread_pnl,
+                    closed=True,
+                )
+            )
 
         logger.info(
             "mm.quoted",

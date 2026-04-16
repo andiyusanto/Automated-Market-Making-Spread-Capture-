@@ -12,7 +12,11 @@ Flow:
 """
 
 import asyncio
+import json
+import random
 import time
+import xml.etree.ElementTree as ET
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -22,6 +26,7 @@ import structlog
 from core.client import PolymarketClient, Market
 from core.wallet import Wallet
 from risk.manager import RiskManager
+from utils.metrics import MetricsTracker, Trade
 
 logger = structlog.get_logger()
 
@@ -84,12 +89,16 @@ class NewsRepricer:
         risk: RiskManager,
         anthropic_api_key: str,
         dry_run: bool = True,
+        mock_claude: bool = False,
+        metrics: Optional[MetricsTracker] = None,
     ):
         self.client = client
         self.wallet = wallet
         self.risk = risk
         self.anthropic_key = anthropic_api_key
         self.dry_run = dry_run
+        self.mock_claude = mock_claude
+        self.metrics = metrics
 
         # Strategy params
         self.min_edge_cents: float = 5.0  # Minimum 5 cent edge to trade
@@ -99,9 +108,21 @@ class NewsRepricer:
         self.max_position_per_signal: float = 200.0
 
         # State
+        # Bounded: set for O(1) lookup, deque to track insertion order for eviction
         self._seen_headlines: set[str] = set()
+        self._seen_headlines_order: deque[str] = deque(maxlen=1000)
         self._http: Optional[httpx.AsyncClient] = None
         self._running = False
+        # Limit concurrent Claude API calls to avoid burst costs/rate limits
+        self._claude_semaphore = asyncio.Semaphore(5)
+
+    def _mark_seen(self, headline: str):
+        """Add headline to bounded seen-set, evicting the oldest if at capacity."""
+        if len(self._seen_headlines_order) == self._seen_headlines_order.maxlen:
+            evicted = self._seen_headlines_order[0]
+            self._seen_headlines.discard(evicted)
+        self._seen_headlines_order.append(headline)
+        self._seen_headlines.add(headline)
 
     async def start(self, markets: list[Market]):
         """Start monitoring news and trading."""
@@ -121,7 +142,7 @@ class NewsRepricer:
                         await self._execute_signal(signal)
 
                     for item in new_items:
-                        self._seen_headlines.add(item.headline)
+                        self._mark_seen(item.headline)
 
             except Exception as e:
                 logger.error("news.error", error=str(e))
@@ -134,25 +155,30 @@ class NewsRepricer:
             await self._http.aclose()
 
     async def _fetch_news(self) -> list[NewsItem]:
-        """Fetch latest news from RSS feeds. Simple XML parsing."""
+        """Fetch latest news from RSS feeds using stdlib XML parsing."""
         items = []
         for feed_url in NEWS_FEEDS:
             try:
                 resp = await self._http.get(feed_url)
                 if resp.status_code == 200:
-                    # Basic RSS parsing (production: use feedparser)
-                    text = resp.text
-                    titles = self._extract_between(text, "<title>", "</title>")
-                    descriptions = self._extract_between(text, "<description>", "</description>")
-
-                    for i, title in enumerate(titles[:10]):
-                        desc = descriptions[i] if i < len(descriptions) else ""
+                    root = ET.fromstring(resp.text)
+                    for entry in root.iter("item"):
+                        title_el = entry.find("title")
+                        desc_el = entry.find("description")
+                        link_el = entry.find("link")
+                        if title_el is None or not title_el.text:
+                            continue
                         items.append(
                             NewsItem(
-                                headline=title,
-                                summary=desc[:500],
+                                headline=title_el.text.strip(),
+                                summary=(desc_el.text or "")[:500].strip()
+                                if desc_el is not None
+                                else "",
                                 source=feed_url,
                                 timestamp=time.time(),
+                                url=(link_el.text or "").strip()
+                                if link_el is not None
+                                else "",
                             )
                         )
             except Exception as e:
@@ -160,38 +186,26 @@ class NewsRepricer:
 
         return items
 
-    @staticmethod
-    def _extract_between(text: str, start_tag: str, end_tag: str) -> list[str]:
-        results = []
-        pos = 0
-        while True:
-            s = text.find(start_tag, pos)
-            if s == -1:
-                break
-            s += len(start_tag)
-            e = text.find(end_tag, s)
-            if e == -1:
-                break
-            results.append(text[s:e].strip())
-            pos = e + len(end_tag)
-        return results
-
     async def _score_all(
         self, news_items: list[NewsItem], markets: list[Market]
     ) -> list[TradeSignal]:
-        """Score each news item against each market using Claude."""
-        signals = []
+        """Score each news×market pair concurrently, capped at 5 parallel Claude calls."""
 
-        for item in news_items:
-            for market in markets:
+        async def bounded_score(item: NewsItem, market: Market) -> Optional[TradeSignal]:
+            async with self._claude_semaphore:
                 try:
-                    signal = await self._score_news(item, market)
-                    if signal:
-                        signals.append(signal)
+                    return await self._score_news(item, market)
                 except Exception as e:
                     logger.debug("news.score_error", error=str(e))
+                    return None
 
-        # Sort by edge size descending
+        tasks = [
+            bounded_score(item, market)
+            for item in news_items
+            for market in markets
+        ]
+        results = await asyncio.gather(*tasks)
+        signals = [r for r in results if r is not None]
         signals.sort(key=lambda s: s.edge, reverse=True)
         return signals
 
@@ -204,6 +218,10 @@ class NewsRepricer:
             return None
 
         current_prob = book.mid_price
+
+        # --- Mock mode: skip real Claude call, return synthetic signal ---
+        if self.mock_claude:
+            return self._mock_score(news, market, current_prob)
 
         prompt = SCORING_PROMPT.format(
             question=market.question,
@@ -221,7 +239,7 @@ class NewsRepricer:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": 300,
                 "messages": [{"role": "user", "content": prompt}],
             },
@@ -234,8 +252,6 @@ class NewsRepricer:
         data = resp.json()
         text = data["content"][0]["text"]
 
-        # Parse JSON response
-        import json
         try:
             score = json.loads(text)
         except json.JSONDecodeError:
@@ -283,6 +299,41 @@ class NewsRepricer:
             reasoning=score.get("reasoning", ""),
         )
 
+    def _mock_score(
+        self, news: NewsItem, market: Market, current_prob: float
+    ) -> Optional["TradeSignal"]:
+        """
+        Zero-cost substitute for the real Claude call.
+        Mimics realistic filter rates (~15% of pairs produce a signal)
+        so the full bot flow can be tested without any API spend.
+        """
+        # 85% of news×market pairs are irrelevant — filtered out just like real Claude
+        if random.random() > 0.15:
+            return None
+
+        confidence = round(random.uniform(0.60, 0.85), 2)
+        # Shift probability by 5–15 cents in a random direction
+        shift = random.uniform(0.05, 0.15) * random.choice([-1, 1])
+        new_prob = max(0.05, min(0.95, current_prob + shift))
+        edge = abs(new_prob - current_prob)
+
+        if edge < self.min_edge_cents / 100 or confidence < self.min_confidence:
+            return None
+
+        direction = "BUY_YES" if new_prob > current_prob else "BUY_NO"
+        edge_mult = min(edge / 0.10, 2.0)
+        size = min(self.base_size * confidence * edge_mult, self.max_position_per_signal)
+
+        logger.debug("news.mock_signal", market=market.question[:40], direction=direction)
+        return TradeSignal(
+            market=market,
+            direction=direction,
+            edge=round(edge * 100, 1),
+            confidence=confidence,
+            size=round(size, 2),
+            reasoning="[MOCK] simulated signal — no real Claude call made",
+        )
+
     async def _execute_signal(self, signal: TradeSignal):
         """Execute a trade signal after risk checks."""
         token_id = (
@@ -325,3 +376,25 @@ class NewsRepricer:
             size=size,
             dry_run=self.dry_run,
         )
+
+        # Record fill (simulated immediately in dry_run; approximate for live GTC orders)
+        self.wallet.record_fill(
+            token_id=token_id,
+            side=side,
+            buy_sell="BUY",
+            size=size,
+            price=price,
+        )
+
+        if self.metrics:
+            self.metrics.record_trade(
+                Trade(
+                    timestamp=time.time(),
+                    strategy="news_repricing",
+                    market=signal.market.condition_id,
+                    side=side,
+                    direction="BUY",
+                    size=size,
+                    price=price,
+                )
+            )

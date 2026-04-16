@@ -3,6 +3,7 @@ Wallet & position management.
 Tracks holdings, cost basis, and realized PnL.
 """
 
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 import structlog
@@ -59,10 +60,13 @@ class Wallet:
             self.positions[key] = Position(token_id=token_id, side=side)
         return self.positions[key]
 
-    def record_fill(self, token_id: str, side: str, buy_sell: str, size: float, price: float):
-        """Record an order fill."""
+    def record_fill(
+        self, token_id: str, side: str, buy_sell: str, size: float, price: float
+    ) -> Optional[float]:
+        """Record an order fill. Returns realized PnL for SELL fills, else None."""
         pos = self.get_position(token_id, side)
         cost = size * price
+        pnl: Optional[float] = None
 
         if buy_sell == "BUY":
             pos.add(size, price)
@@ -84,6 +88,7 @@ class Wallet:
             position_size=pos.size,
             cash=round(self.cash, 2),
         )
+        return pnl
 
     @property
     def total_exposure(self) -> float:
@@ -127,3 +132,49 @@ class Wallet:
             "total_trades": self.total_trades,
             "win_rate": round(self.win_rate * 100, 1) if self.win_rate else 0,
         }
+
+    def save(self, path: str):
+        """Persist wallet state to a JSON file."""
+        data = {
+            "cash": self.cash,
+            "total_realized_pnl": self.total_realized_pnl,
+            "total_trades": self.total_trades,
+            "winning_trades": self.winning_trades,
+            "positions": {
+                key: {
+                    "token_id": pos.token_id,
+                    "side": pos.side,
+                    "size": pos.size,
+                    "avg_cost": pos.avg_cost,
+                    "realized_pnl": pos.realized_pnl,
+                }
+                for key, pos in self.positions.items()
+                if pos.size > 0
+            },
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info("wallet.saved", path=path, positions=len(data["positions"]))
+
+    def load(self, path: str):
+        """Restore wallet state from a JSON file. Silently skips if file absent."""
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.cash = data.get("cash", self.cash)
+            self.total_realized_pnl = data.get("total_realized_pnl", 0.0)
+            self.total_trades = data.get("total_trades", 0)
+            self.winning_trades = data.get("winning_trades", 0)
+            for key, pd in data.get("positions", {}).items():
+                self.positions[key] = Position(
+                    token_id=pd["token_id"],
+                    side=pd["side"],
+                    size=pd["size"],
+                    avg_cost=pd["avg_cost"],
+                    realized_pnl=pd["realized_pnl"],
+                )
+            logger.info("wallet.loaded", path=path, positions=len(self.positions))
+        except FileNotFoundError:
+            logger.info("wallet.no_state_file", path=path)
+        except Exception as e:
+            logger.warning("wallet.load_error", path=path, error=str(e))

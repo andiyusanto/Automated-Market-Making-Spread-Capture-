@@ -30,6 +30,10 @@ class Config(BaseModel):
     # General
     log_level: str = Field(default="INFO")
     dry_run: bool = Field(default=True)
+    mock_claude: bool = Field(default=False)  # Skip real Claude calls; use fake signals
+    wallet_balance: float = Field(default=10000.0)
+    state_file: str = Field(default="polymarket_state.json")
+    db_path: str = Field(default="trades.db")
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -49,6 +53,10 @@ class Config(BaseModel):
             ),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
+            mock_claude=os.getenv("MOCK_CLAUDE", "false").lower() == "true",
+            wallet_balance=float(os.getenv("WALLET_BALANCE", "10000")),
+            state_file=os.getenv("STATE_FILE", "polymarket_state.json"),
+            db_path=os.getenv("DB_PATH", "trades.db"),
         )
 
 

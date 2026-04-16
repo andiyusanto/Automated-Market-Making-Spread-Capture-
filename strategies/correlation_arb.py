@@ -26,6 +26,7 @@ import structlog
 from core.client import PolymarketClient, Market
 from core.wallet import Wallet
 from risk.manager import RiskManager
+from utils.metrics import MetricsTracker, Trade
 
 logger = structlog.get_logger()
 
@@ -57,11 +58,13 @@ class CorrelationArb:
         wallet: Wallet,
         risk: RiskManager,
         dry_run: bool = True,
+        metrics: Optional[MetricsTracker] = None,
     ):
         self.client = client
         self.wallet = wallet
         self.risk = risk
         self.dry_run = dry_run
+        self.metrics = metrics
 
         # Strategy params
         self.min_edge_cents: float = 4.0
@@ -140,6 +143,18 @@ class CorrelationArb:
         # Record price history for dynamic correlation estimation
         self._record_price(pair.market_a.condition_id, price_a)
         self._record_price(pair.market_b.condition_id, price_b)
+
+        # Update correlation dynamically once enough history has accumulated
+        dynamic_corr = self.estimate_correlation(
+            pair.market_a.condition_id, pair.market_b.condition_id
+        )
+        if dynamic_corr is not None:
+            pair.correlation = dynamic_corr
+            logger.debug(
+                "corr_arb.correlation_updated",
+                pair=pair.label,
+                correlation=dynamic_corr,
+            )
 
         # Calculate implied price of B given A (and vice versa)
         # Simple model: P(B) ≈ P(A) * correlation + (1 - correlation) * base_rate
@@ -277,3 +292,25 @@ class CorrelationArb:
             size=size,
             dry_run=self.dry_run,
         )
+
+        # Record fill (simulated in dry_run; approximate for live GTC orders)
+        self.wallet.record_fill(
+            token_id=token_id,
+            side=side,
+            buy_sell="BUY",
+            size=size,
+            price=price,
+        )
+
+        if self.metrics:
+            self.metrics.record_trade(
+                Trade(
+                    timestamp=time.time(),
+                    strategy="correlation_arb",
+                    market=signal.cheap_market.condition_id,
+                    side=side,
+                    direction="BUY",
+                    size=size,
+                    price=price,
+                )
+            )

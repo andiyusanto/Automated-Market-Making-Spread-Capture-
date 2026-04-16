@@ -72,6 +72,7 @@ class PolymarketClient:
         self._http: Optional[httpx.AsyncClient] = None
         self._last_request_time = 0.0
         self._min_interval = 0.1  # 10 req/s rate limit
+        self._rate_lock = asyncio.Lock()
 
     async def connect(self):
         self._http = httpx.AsyncClient(
@@ -89,10 +90,11 @@ class PolymarketClient:
             await self._http.aclose()
 
     async def _rate_limit(self):
-        elapsed = time.monotonic() - self._last_request_time
-        if elapsed < self._min_interval:
-            await asyncio.sleep(self._min_interval - elapsed)
-        self._last_request_time = time.monotonic()
+        async with self._rate_lock:
+            elapsed = time.monotonic() - self._last_request_time
+            if elapsed < self._min_interval:
+                await asyncio.sleep(self._min_interval - elapsed)
+            self._last_request_time = time.monotonic()
 
     # ── Market Discovery ────────────────────────────────────
 

@@ -42,9 +42,9 @@ class BotOrchestrator:
             passphrase=config.passphrase,
             private_key=config.private_key,
         )
-        self.wallet = Wallet(initial_balance=0.0)
+        self.wallet = Wallet(initial_balance=config.wallet_balance)
         self.risk = RiskManager(config=config.risk, wallet=self.wallet)
-        self.metrics = MetricsTracker()
+        self.metrics = MetricsTracker(db_path=config.db_path)
 
         # Strategies
         self.market_maker = MarketMaker(
@@ -52,6 +52,7 @@ class BotOrchestrator:
             wallet=self.wallet,
             risk=self.risk,
             dry_run=self.dry_run,
+            metrics=self.metrics,
         )
         self.news_repricer = NewsRepricer(
             client=self.client,
@@ -59,12 +60,15 @@ class BotOrchestrator:
             risk=self.risk,
             anthropic_api_key=config.anthropic_api_key,
             dry_run=self.dry_run,
+            mock_claude=config.mock_claude,
+            metrics=self.metrics,
         )
         self.correlation_arb = CorrelationArb(
             client=self.client,
             wallet=self.wallet,
             risk=self.risk,
             dry_run=self.dry_run,
+            metrics=self.metrics,
         )
 
     async def start(self):
@@ -79,6 +83,9 @@ class BotOrchestrator:
 
         if self.dry_run:
             logger.warning("bot.DRY_RUN_MODE — no real orders will be placed")
+
+        # Restore wallet state from previous run if available
+        self.wallet.load(config.state_file)
 
         # Connect to Polymarket
         await self.client.connect()
@@ -136,7 +143,11 @@ class BotOrchestrator:
         await self.correlation_arb.stop()
         await self.client.close()
 
+        # Persist wallet state for next run
+        self.wallet.save(config.state_file)
+
         self.metrics.print_summary()
+        self.metrics.close_session()
         logger.info("bot.stopped", **self.wallet.summary())
 
     async def _metrics_loop(self):
